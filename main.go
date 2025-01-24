@@ -5,28 +5,84 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
 )
 
+// CityInfo represents city data
 type CityInfo struct {
 	City *string
 	ISO2 *string
 }
 
+// TrieNode represents a node in the trie
 type TrieNode struct {
 	Children map[rune]*TrieNode
 	Cities   []CityInfo
 }
 
+// Trie represents a prefix tree for city searching
 type Trie struct {
 	Root *TrieNode
 	mu   sync.RWMutex
 }
 
+// RateLimiter manages rate limiting per IP
+type RateLimiter struct {
+	visitors map[string]*rate.Limiter
+	mu       sync.Mutex
+}
+
+// NewRateLimiter initializes a rate limiter with periodic cleanup
+func NewRateLimiter() *RateLimiter {
+	rl := &RateLimiter{
+		visitors: make(map[string]*rate.Limiter),
+	}
+
+	// Cleanup unused IPs every 10 minutes
+	go func() {
+		for {
+			time.Sleep(10 * time.Minute)
+			rl.cleanupOldIPs()
+		}
+	}()
+
+	return rl
+}
+
+// GetLimiter returns the rate limiter for a given IP, creating one if necessary
+func (rl *RateLimiter) GetLimiter(ip string) *rate.Limiter {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	limiter, exists := rl.visitors[ip]
+	if !exists {
+		limiter = rate.NewLimiter(rate.Limit(5), 10) // 5 requests per second, burst of 10
+		rl.visitors[ip] = limiter
+	}
+	return limiter
+}
+
+// Cleanup function to remove inactive IPs
+func (rl *RateLimiter) cleanupOldIPs() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	for ip, limiter := range rl.visitors {
+		if limiter.AllowN(time.Now(), 1) { // If unused for a while, remove it
+			delete(rl.visitors, ip)
+		}
+	}
+}
+
+// NewTrie initializes a new trie
 func NewTrie() *Trie {
 	return &Trie{
 		Root: &TrieNode{
@@ -35,11 +91,11 @@ func NewTrie() *Trie {
 	}
 }
 
-func (t *Trie) Insert(city, iso2 *string) {
+// Insert adds a city to the trie
+func (t *Trie) Insert(city, iso2 string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
-	lowerCity := strings.ToLower(*city)
+	lowerCity := strings.ToLower(city)
 	for i := 0; i < len(lowerCity); i++ {
 		currentWord := lowerCity[i:]
 		current := t.Root
@@ -51,17 +107,17 @@ func (t *Trie) Insert(city, iso2 *string) {
 			}
 			current = current.Children[char]
 			if len(current.Cities) < 1000 {
-				current.Cities = append(current.Cities, CityInfo{City: city, ISO2: iso2})
+				current.Cities = append(current.Cities, CityInfo{City: &city, ISO2: &iso2})
 			}
 		}
 	}
 }
 
-func (t *Trie) Search(prefix *string, limit *int) []CityInfo {
+// Search returns city matches for a given prefix
+func (t *Trie) Search(prefix string, limit int) []CityInfo {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-
-	lowerPrefix := strings.ToLower(*prefix)
+	lowerPrefix := strings.ToLower(prefix)
 	current := t.Root
 	for _, char := range lowerPrefix {
 		if current.Children[char] == nil {
@@ -69,15 +125,15 @@ func (t *Trie) Search(prefix *string, limit *int) []CityInfo {
 		}
 		current = current.Children[char]
 	}
-
-	if len(current.Cities) > *limit {
-		return current.Cities[:*limit]
+	if len(current.Cities) > limit {
+		return current.Cities[:limit]
 	}
 	return current.Cities
 }
 
-func loadCitiesData(trie *Trie, filename *string) error {
-	file, err := os.Open(*filename)
+// Load cities data from CSV into the trie
+func loadCitiesData(trie *Trie, filename string) error {
+	file, err := os.Open(filename)
 	if err != nil {
 		return err
 	}
@@ -90,21 +146,47 @@ func loadCitiesData(trie *Trie, filename *string) error {
 	}
 
 	for _, record := range records[1:] {
-		cityPtr := record[0]
-		iso2Ptr := record[1]
-		trie.Insert(&cityPtr, &iso2Ptr)
+		city := record[0]
+		iso2 := record[1]
+		trie.Insert(city, iso2)
 	}
 	return nil
 }
 
+// Middleware to handle CORS
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	}
+}
+
+// Extract client IP, supporting proxies
+func getClientIP(r *http.Request) string {
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip == "" {
+		ip, _, _ = net.SplitHostPort(r.RemoteAddr)
+	}
+	return ip
+}
+
+// Middleware for rate limiting
+func rateLimitMiddleware(rateLimiter *RateLimiter, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ip := getClientIP(r)
+
+		// Get rate limiter for this IP
+		limiter := rateLimiter.GetLimiter(ip)
+
+		// Check if the request is allowed
+		if !limiter.Allow() {
+			http.Error(w, "Rate limit exceeded. Please slow down.", http.StatusTooManyRequests)
 			return
 		}
 
@@ -112,6 +194,7 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// Handler for city search
 func searchCitiesHandler(trie *Trie) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		searchTerm := r.URL.Query().Get("q")
@@ -133,7 +216,7 @@ func searchCitiesHandler(trie *Trie) http.HandlerFunc {
 		}
 
 		limit = min(limit, 1000)
-		results := trie.Search(&searchTerm, &limit)
+		results := trie.Search(searchTerm, limit)
 
 		response := struct {
 			FilteredResults []string `json:"filteredResults"`
@@ -154,6 +237,7 @@ func searchCitiesHandler(trie *Trie) http.HandlerFunc {
 	}
 }
 
+// Min function
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -163,14 +247,23 @@ func min(a, b int) int {
 
 func main() {
 	cityTrie := NewTrie()
-
 	filename := "./world_city_data.csv"
-	err := loadCitiesData(cityTrie, &filename)
+	err := loadCitiesData(cityTrie, filename)
 	if err != nil {
 		log.Fatalf("Error loading cities data: %v", err)
 	}
 
-	http.HandleFunc("/searchCities", corsMiddleware(searchCitiesHandler(cityTrie)))
+	// Create a rate limiter
+	rateLimiter := NewRateLimiter()
+
+	// Register routes with middleware
+	http.HandleFunc("/searchCities",
+		corsMiddleware(
+			rateLimitMiddleware(rateLimiter,
+				searchCitiesHandler(cityTrie),
+			),
+		),
+	)
 
 	port := 3001
 	log.Printf("Server starting on port %d", port)
